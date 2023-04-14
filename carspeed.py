@@ -1,8 +1,8 @@
 # CarSpeed Version 3.0
 
 # import the necessary packages
-from picamera.array import PiRGBArray
-from picamera import PiCamera
+from picamera2 import Picamera2
+from libcamera import Transform
 import time
 import math
 import datetime
@@ -10,7 +10,97 @@ import cv2
 import paho.mqtt.client as mqtt
 import numpy as np
 import argparse
+import configparser
 
+###############################################################################
+# set up variables ############################################################
+###############################################################################
+# define some constants
+L2R_DISTANCE = 70  #<---- enter your distance-to-road value for cars going left to right here
+R2L_DISTANCE = 80  #<---- enter your distance-to-road value for cars going left to right here
+MIN_SPEED_IMAGE = 8  #<---- enter the minimum speed for saving images
+MIN_SPEED_SAVE = 10  #<---- enter the minimum speed for publishing to MQTT broker and saving to CSV
+MAX_SPEED_SAVE = 130  #<---- enter the maximum speed for publishing to MQTT broker and saving to CSV
+IMAGEWIDTH = 1536  #<---- Enter the horizontal resolution to run camera at
+IMAGEHEIGHT = 864 #<---- Enter the vertical resolution to run camera at
+FPS = 12 #<---- Camera FPS at set resolution
+FOV = 66 #<---- Camera FoV - Pi Camera v2 = 62.2, v3 = 66
+MQTT_ADDRESS = '10.10.10.10' #<---- MQTT broker address
+MQTT_USER = 'user' #<---- MQTT broker username
+MQTT_PASS = 'secret' #<---- MQTT broker password
+
+# Config Toggles
+SAVE_CSV = True  #<---- record the results in .csv format in carspeed_(date).csv
+SHOW_BOUNDS = False
+SHOW_IMAGE = False 
+USE_MQTT = False # Enable or disable MQTT
+HFLIP = 1
+VFLIP = 1
+
+THRESHOLD = 25
+MIN_AREA = 175
+BLURSIZE = (15,15)
+RESOLUTION = [IMAGEWIDTH,IMAGEHEIGHT]
+
+# the following enumerated values are used to make the program more readable
+WAITING = 0
+TRACKING = 1
+SAVING = 2
+UNKNOWN = 0
+LEFT_TO_RIGHT = 1
+RIGHT_TO_LEFT = 2
+TOO_CLOSE = 0.4
+MIN_SAVE_BUFFER = 2
+
+###############################################################################
+# Read in variables from config file and CLI ##################################
+###############################################################################
+
+# construct the argument parser and parse the arguments
+ap = argparse.ArgumentParser()
+ap.add_argument("-ulx", "--upper_left_x", help="upper left x coord")
+ap.add_argument("-uly", "--upper_left_y", help="upper left y coord")
+ap.add_argument("-lrx", "--lower_right_x", help="lower right x coord")
+ap.add_argument("-lry", "--lower_right_y", help="lower right y coord")
+args = vars(ap.parse_args())
+
+config = configparser.ConfigParser()
+config.read("config.ini")
+
+vars = {}
+for var_name in ['upper_left_x', 'upper_left_y', 'lower_right_x', 'lower_right_y']:
+    try:
+        vars[var_name] = int(args[var_name])
+    except:
+        try:
+            vars[var_name] = int(config.get('DEFAULT', var_name))
+        except:
+            print(f'"{var_name}" is a required argument')
+            exit()
+    print(f"{var_name} value: {vars[var_name]}")
+
+upper_left_x = vars["upper_left_x"]
+upper_left_y = vars["upper_left_y"]
+lower_right_x = vars["lower_right_x"]
+lower_right_y = vars["lower_right_y"]
+ 
+# calculate the the width of the image at the distance specified
+## This is not currently working
+## frame_width_ft = 2*(math.tan(math.radians(FOV*0.5))*DISTANCE)
+## l2r_frame_width_ft = 2*(math.tan(math.radians(FOV*0.5))*L2R_DISTANCE)
+## r2l_frame_width_ft = 2*(math.tan(math.radians(FOV*0.5))*R2L_DISTANCE)
+l2r_frame_width_ft = 77 # Temporarily hardcode until I figure out why formula doesn't work
+r2l_frame_width_ft = 79 # Temporarily hardcode until I figure out why formula doesn't work
+l2r_ftperpixel = l2r_frame_width_ft / float(IMAGEWIDTH)
+r2l_ftperpixel = r2l_frame_width_ft / float(IMAGEWIDTH)
+print("L2R Image width in feet {} at {} from camera".format("%.0f" % l2r_frame_width_ft,"%.0f" % L2R_DISTANCE))
+print("R2L Image width in feet {} at {} from camera".format("%.0f" % r2l_frame_width_ft,"%.0f" % R2L_DISTANCE))
+###############################################################################
+
+
+###############################################################################
+# Set up functions ############################################################
+###############################################################################
 
 # place a prompt on the displayed image
 def prompt_on_image(txt):
@@ -94,7 +184,10 @@ def store_image():
     cv2.putText(image, "%.0f mph" % mean_speed,
     (cntr_x , int(IMAGEHEIGHT * 0.2)), cv2.FONT_HERSHEY_SIMPLEX, 2.00, (0, 255, 0), 3)
     # and save the image to disk
-    imageFilename = "car_at_" + cap_time.strftime("%Y%m%d_%H%M%S") + ".jpg"
+    if mean_speed < 30:
+        imageFilename = "logging/29-/car_at_" + cap_time.strftime("%Y%m%d_%H%M%S") + ".jpg"
+    else:
+        imageFilename = "logging/30+/car_at_" + cap_time.strftime("%Y%m%d_%H%M%S") + ".jpg"
     cv2.imwrite(imageFilename,image)
 
 def store_traffic_data():
@@ -106,70 +199,18 @@ def store_traffic_data():
 
     record_speed(csvString)
 
-    jsonstring = '{"created_at":'+'"'+ cap_time.strftime("%Y-%m-%d")+\
-        ' ' + cap_time.strftime('%H:%M:%S:%f')+'"' +\
-        ',"field1":'+("%.0f" % mean_speed)+\
-        ',"field2":' + ("%d" % direction) +\
-        ',"field3":' + ("%d" % counter) +\
-        ',"field4":' + ("%.0f" % sd) +\
-        '}'
-    client.publish('traffic', jsonstring)  #Publish MQTT data
+    if USE_MQTT:
+        jsonstring = '{"created_at":'+'"'+ cap_time.strftime("%Y-%m-%d")+\
+            ' ' + cap_time.strftime('%H:%M:%S:%f')+'"' +\
+            ',"field1":'+("%.0f" % mean_speed)+\
+            ',"field2":' + ("%d" % direction) +\
+            ',"field3":' + ("%d" % counter) +\
+            ',"field4":' + ("%.0f" % sd) +\
+            '}'
+        client.publish('traffic', jsonstring)  #Publish MQTT data
     
+###############################################################################
     
-# define some constants
-L2R_DISTANCE = 47  #<---- enter your distance-to-road value for cars going left to right here
-R2L_DISTANCE = 37  #<---- enter your distance-to-road value for cars going left to right here
-MIN_SPEED_IMAGE = 50  #<---- enter the minimum speed for saving images
-SAVE_CSV = True  #<---- record the results in .csv format in carspeed_(date).csv
-MIN_SPEED_SAVE = 10  #<---- enter the minimum speed for publishing to MQTT broker and saving to CSV
-MAX_SPEED_SAVE = 80  #<---- enter the maximum speed for publishing to MQTT broker and saving to CSV
-
-THRESHOLD = 25
-MIN_AREA = 175
-BLURSIZE = (15,15)
-IMAGEWIDTH = 1024
-IMAGEHEIGHT = 592
-RESOLUTION = [IMAGEWIDTH,IMAGEHEIGHT]
-FOV = 62.2 # Pi Camera v2 is wider
-FPS = 30
-SHOW_BOUNDS = True
-SHOW_IMAGE = True
-
-# the following enumerated values are used to make the program more readable
-WAITING = 0
-TRACKING = 1
-SAVING = 2
-UNKNOWN = 0
-LEFT_TO_RIGHT = 1
-RIGHT_TO_LEFT = 2
-TOO_CLOSE = 0.4
-MIN_SAVE_BUFFER = 2
-
-# construct the argument parser and parse the arguments
-ap = argparse.ArgumentParser()
-ap.add_argument("-ulx", "--upper_left_x", required=True,
-    help="upper left x coord")
-ap.add_argument("-uly", "--upper_left_y", required=True,
-    help="upper left y coord")
-ap.add_argument("-lrx", "--lower_right_x", required=True,
-    help="lower right x coord")
-ap.add_argument("-lry", "--lower_right_y", required=True,
-    help="lower right y coord")
-args = vars(ap.parse_args())
-
-upper_left_x = int(args["upper_left_x"]);
-upper_left_y = int(args["upper_left_y"]);
-lower_right_x = int(args["lower_right_x"]);
-lower_right_y = int(args["lower_right_y"]);
-
-# calculate the the width of the image at the distance specified
-#frame_width_ft = 2*(math.tan(math.radians(FOV*0.5))*DISTANCE)
-l2r_frame_width_ft = 2*(math.tan(math.radians(FOV*0.5))*L2R_DISTANCE)
-r2l_frame_width_ft = 2*(math.tan(math.radians(FOV*0.5))*R2L_DISTANCE)
-l2r_ftperpixel = l2r_frame_width_ft / float(IMAGEWIDTH)
-r2l_ftperpixel = r2l_frame_width_ft / float(IMAGEWIDTH)
-print("L2R Image width in feet {} at {} from camera".format("%.0f" % l2r_frame_width_ft,"%.0f" % L2R_DISTANCE))
-print("R2L Image width in feet {} at {} from camera".format("%.0f" % r2l_frame_width_ft,"%.0f" % R2L_DISTANCE))
 
 
 # state maintains the state of the speed computation process
@@ -209,7 +250,6 @@ setup_complete = False
 tracking = False
 text_on_image = 'No cars'
 prompt = ''
-broker_address = 'emonpi'
 save_image = False
 t1 = 0.0  #timer
 t2 = 0.0  #timer
@@ -220,14 +260,14 @@ adjusted_min_area = MIN_AREA
 
 
 # initialise the camera. 
-# Adjust vflip and hflip to reflect your camera's orientation
-camera = PiCamera()
-camera.resolution = RESOLUTION
-camera.framerate = FPS
-camera.vflip = False
-camera.hflip = False
+# Apply VFLIP, HFLIP, RESOLUTION, and FPS settings
+camera = Picamera2()
+camera.video_configuration.controls.FrameRate = FPS
+config = camera.create_preview_configuration(main={"format": 'XRGB8888', "size": RESOLUTION})
+config["transform"] = Transform(hflip=HFLIP, vflip=VFLIP)
+camera.configure(config)
 
-rawCapture = PiRGBArray(camera, size=camera.resolution)
+camera.start()
 # allow the camera to warm up
 time.sleep(0.9)
 
@@ -236,13 +276,14 @@ cv2.namedWindow("Speed Camera")
 cv2.moveWindow("Speed Camera", 10, 40)
  
 #Create MQTT client and connect
-client = mqtt.Client('traffic_cam')
-client.username_pw_set('xxxxxx', password='xxxxxxxxxxxxx')
-client.connect(broker_address)
-client.loop_start()
+if USE_MQTT:
+    client = mqtt.Client('traffic_cam')
+    client.username_pw_set(MQTT_USER, password=MQTT_PASS)
+    client.connect(MQTT_ADDRESS)
+    client.loop_start()
 
 if SAVE_CSV:
-    csvfileout = "carspeed_{}.csv".format(datetime.datetime.now().strftime("%Y%m%d_%H%M"))
+    csvfileout = "logging/carspeed_{}.csv".format(datetime.datetime.now().strftime("%Y%m%d_%H%M"))
     record_speed('DateTime,Speed,Direction, Counter,SD, Image,')
 else:
     csvfileout = ''
@@ -263,9 +304,8 @@ print(" monitored_area {}".format(monitored_width * monitored_height))
 # capture frames from the camera (using capture_continuous.
 #   This keeps the picamera in capture mode - it doesn't need
 #   to prep for each frame's capture.
-for frame in camera.capture_continuous(rawCapture, format="bgr", use_video_port=True):
-    # grab the raw NumPy array representing the image 
-    image = frame.array
+while True:
+    image = camera.capture_array()
  
     # crop area defined by [y1:y2,x1:x2]
     gray = image[upper_left_y:lower_right_y,upper_left_x:lower_right_x]
@@ -278,7 +318,6 @@ for frame in camera.capture_continuous(rawCapture, format="bgr", use_video_port=
     # if the base image has not been defined, initialize it
     if base_image is None:
         base_image = gray.copy().astype("float")
-        rawCapture.truncate(0)
         cv2.imshow("Speed Camera", image)
   
 
@@ -300,7 +339,7 @@ for frame in camera.capture_continuous(rawCapture, format="bgr", use_video_port=
     # dilate the thresholded image to fill in any holes, then find contours
     # on thresholded image
     thresh = cv2.dilate(thresh, None, iterations=2)
-    (_, cnts, _) = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    (cnts, _) = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
 
     # look for motion 
     motion_found = False
@@ -358,7 +397,6 @@ for frame in camera.capture_continuous(rawCapture, format="bgr", use_video_port=
                 text_on_image = 'No Car Detected'
                 motion_found = False
                 biggest_area = 0
-                rawCapture.truncate(0)
                 base_image = None
                 print('Resetting')
                 continue             
@@ -503,11 +541,11 @@ for frame in camera.capture_continuous(rawCapture, format="bgr", use_video_port=
       
         # if the `q` key is pressed, break from the loop and terminate processing
         if key == ord("q"):
-            client.loop_stop()
-            client.disconnect()   ##disconnect from mqtt broker
+            if USE_MQTT:
+                client.loop_stop()
+                client.disconnect()   ##disconnect from mqtt broker
             break
          
     # clear the stream in preparation for the next frame
-    rawCapture.truncate(0)
 # cleanup the camera and close any open windows
 cv2.destroyAllWindows()
